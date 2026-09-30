@@ -52,6 +52,7 @@ class VideoProcessor:
         raw_output_path = self.settings.processed_dir / f"{job_id}_raw.mp4"
         final_output_path = self.settings.processed_dir / f"{job_id}.mp4"
         report_path = self.settings.processed_dir / f"{job_id}_report.json"
+        evidence_dir = self.settings.processed_dir / job_id / "evidence"
         try:
             if not job.upload_path.is_file():
                 raise ProcessingError(f"Uploaded file is missing: {job.upload_path}")
@@ -91,10 +92,12 @@ class VideoProcessor:
 
                 run_inference = (frame_index % stride == 0)
                 all_detections: List[Detection] = []
+                newly_confirmed: List[ViolationEvent] = []
                 for key, det in detectors.items():
                     if run_inference:
                         out = det.process_frame(frame, frame_index, timestamp_s)
                         last_outputs[key] = out.detections
+                        newly_confirmed.extend(out.events)
                         if out.signal_state is not None:
                             last_signal_state = out.signal_state
                         if out.stop_line is not None:
@@ -107,6 +110,12 @@ class VideoProcessor:
                     dict(confirmed_counts), last_signal_state, last_stop_line,
                     self.settings.draw_context_objects,
                 )
+                if newly_confirmed:
+                    evidence_dir.mkdir(parents=True, exist_ok=True)
+                    for event in newly_confirmed:
+                        filename = f"{event.event_id}.jpg"
+                        if cv2.imwrite(str(evidence_dir / filename), frame):
+                            event.details["evidence_image"] = filename
                 writer.write(frame)
 
                 frame_index += 1
