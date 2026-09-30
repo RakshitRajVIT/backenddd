@@ -81,7 +81,10 @@ class ModelRegistry:
                 model.to(self.device)
                 # Warm-up: surfaces problems at startup and initialises CUDA kernels.
                 dummy = np.zeros((spec.imgsz, spec.imgsz, 3), dtype=np.uint8)
-                model.predict(dummy, imgsz=spec.imgsz, device=self.device, half=self.half, verbose=False)
+                warmup_kwargs = {"imgsz": spec.imgsz, "device": self.device, "verbose": False}
+                if self.half:
+                    warmup_kwargs["half"] = True
+                model.predict(dummy, **warmup_kwargs)
                 names = getattr(model, "names", None) or {}
                 self._names[key] = {int(k): str(v) for k, v in dict(names).items()}
                 self._models[key] = model
@@ -114,15 +117,13 @@ class ModelRegistry:
             raise RuntimeError(f"Model '{key}' is not loaded")
         spec = self.specs[key]
         with self._locks[key]:
-            results = self._models[key].predict(
-                source=frame,
-                conf=spec.conf,
-                iou=spec.iou,
-                imgsz=spec.imgsz,
-                device=self.device,
-                half=self.half,
-                verbose=False,
-            )
+            predict_kwargs = {
+                "source": frame, "conf": spec.conf, "iou": spec.iou,
+                "imgsz": spec.imgsz, "device": self.device, "verbose": False,
+            }
+            if self.half:
+                predict_kwargs["half"] = True
+            results = self._models[key].predict(**predict_kwargs)
         if not results:
             return []
         result = results[0]

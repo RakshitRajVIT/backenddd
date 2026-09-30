@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 import shutil
+import threading
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, File, Request, UploadFile
+from fastapi import APIRouter, File, Request, UploadFile
 from fastapi.responses import FileResponse
 
 from app.errors import JobError
@@ -112,15 +113,27 @@ async def upload_video(request: Request, file: UploadFile = File(...)):
         raise JobError("invalid_video", f"Uploaded file is not a readable video: {exc}", 400) from exc
 
     job = jobs.create_job(original_filename=file.filename, upload_path=dest_path, video=video_info)
+    # Start the worker immediately after the validated upload. This makes the
+    # single user action ("Analyze Traffic Video") atomic from the browser's
+    # perspective and avoids relying on a second HTTP request to begin analysis.
+    started, _ = jobs.try_start_processing(job.job_id)
+    if not started:  # Defensive: a freshly created job must always be startable.
+        raise JobError("job_start_failed", "Could not queue the uploaded video for processing.", 500)
+    threading.Thread(
+        target=ctx.processor.run,
+        args=(job,),
+        name=f"analysis-{job.job_id[:8]}",
+        daemon=True,
+    ).start()
     logger.info("Uploaded job %s (%s, %d bytes)", job.job_id, file.filename, size)
     return ApiResponse(
-        message="Upload accepted.",
+        message="Upload accepted and analysis started.",
         data=UploadData(job_id=job.job_id, filename=file.filename, size_bytes=size, status=job.status, video=video_info),
     )
 
 
 @router.post("/{job_id}/process", response_model=ApiResponse[ProcessData])
-def process_video(job_id: str, request: Request, background_tasks: BackgroundTasks):
+def process_video(job_id: str, request: Request):
     ctx = request.app.state.ctx
     job = _job_or_404(request, job_id)
 
@@ -135,7 +148,15 @@ def process_video(job_id: str, request: Request, background_tasks: BackgroundTas
         raise JobError("duplicate_or_invalid_state", msg, code)
 
     processor: VideoProcessor = ctx.processor
-    background_tasks.add_task(processor.run, job)
+    # Do not use FastAPI BackgroundTasks here: it runs after the response body but
+    # remains attached to the request lifecycle. A standalone worker thread lets
+    # the browser receive the job id immediately while CPU inference continues.
+    threading.Thread(
+        target=processor.run,
+        args=(job,),
+        name=f"analysis-{job_id[:8]}",
+        daemon=True,
+    ).start()
     logger.info("Queued processing for job %s", job_id)
     return ApiResponse(
         message="Processing started.",
@@ -183,6 +204,19 @@ def download_report(job_id: str, request: Request):
     )
 
 
+@router.get("/{job_id}/evidence/{event_id}")
+def get_evidence(job_id: str, event_id: str, request: Request):
+    job = _job_or_404(request, job_id)
+    if job.status != JobStatus.COMPLETED or job.report is None:
+        raise JobError("not_ready", "Evidence is not available until processing is complete.", 409)
+    event = next((item for item in job.report.violations if item.event_id == event_id), None)
+    filename = event.details.get("evidence_image") if event else None
+    path = request.app.state.ctx.settings.processed_dir / job_id / "evidence" / str(filename or "")
+    if not filename or not path.is_file():
+        raise JobError("evidence_not_found", "No evidence frame is available for this event.", 404)
+    return FileResponse(path=path, media_type="image/jpeg", filename=f"{event_id}.jpg")
+
+
 @router.delete("/{job_id}", response_model=ApiResponse[DeleteData])
 def delete_video(job_id: str, request: Request):
     ctx = request.app.state.ctx
@@ -199,6 +233,10 @@ def delete_video(job_id: str, request: Request):
         if path and Path(path).exists():
             if safe_unlink(Path(path)):
                 deleted.append(str(path))
+    evidence_dir = ctx.settings.processed_dir / job_id
+    if evidence_dir.exists():
+        shutil.rmtree(evidence_dir, ignore_errors=True)
+        deleted.append(str(evidence_dir))
 
     ctx.jobs.delete(job_id)
     logger.info("Deleted job %s (%d files removed)", job_id, len(deleted))
